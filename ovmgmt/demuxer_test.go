@@ -1,4 +1,4 @@
-package demux
+package ovmgmt
 
 import (
 	"bytes"
@@ -137,8 +137,8 @@ func mockReader(msgs []string) io.Reader {
 }
 
 func captureMsgs(r io.Reader) (replies, events []string) {
-	replyCh := make(chan []byte)
-	eventCh := make(chan []byte)
+	replyCh := make(chan string)
+	eventCh := make(chan string)
 
 	replies = make([]string, 0)
 	events = make([]string, 0)
@@ -150,14 +150,14 @@ func captureMsgs(r io.Reader) (replies, events []string) {
 
 		case msg, ok := <-replyCh:
 			if ok {
-				replies = append(replies, string(msg))
+				replies = append(replies, msg)
 			} else {
 				replyCh = nil
 			}
 
 		case msg, ok := <-eventCh:
 			if ok {
-				events = append(events, string(msg))
+				events = append(events, msg)
 			} else {
 				eventCh = nil
 			}
@@ -189,13 +189,13 @@ func ExampleDemultiplex() {
 	// No strong need for buffering on this channel because usually
 	// a message sender will immediately block waiting for the
 	// associated response message.
-	replyCh := make(chan []byte)
+	replyCh := make(chan string)
 
 	// Make sure the event channel buffer is deep enough that slow event
 	// processing won't significantly delay synchronous replies. If you
 	// process events quickly, or if you aren't sending any commands
 	// concurrently with acting on events, then this is not so important.
-	eventCh := make(chan []byte, 10)
+	eventCh := make(chan string, 10)
 
 	// Start demultiplexing the message stream in the background.
 	// This goroutine will exit once the reader signals EOF.

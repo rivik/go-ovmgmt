@@ -1,4 +1,4 @@
-package demux
+package ovmgmt
 
 import (
 	"bufio"
@@ -30,7 +30,7 @@ var readErrSynthEvent = []byte("FATAL:Error reading from OpenVPN")
 // io.Reader then a synthetic "FATAL" event will be written to eventCh
 // before the two buffers are closed and the function returns. This
 // synthetic message will have the error message "Error reading from OpenVPN".
-func Demultiplex(r io.Reader, replyCh, eventCh chan<- []byte) {
+func Demultiplex(r io.Reader, rawReplyCh, rawEventCh chan<- string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		buf := scanner.Bytes()
@@ -46,18 +46,18 @@ func Demultiplex(r io.Reader, replyCh, eventCh chan<- []byte) {
 		if buf[0] == '>' {
 			// Trim off the > when we post the message, since it's
 			// redundant after we've demuxed.
-			eventCh <- buf[1:]
+			rawEventCh <- string(buf[1:])
 		} else {
-			replyCh <- buf
+			rawReplyCh <- string(buf)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
 		// Generate a synthetic FATAL event so that the caller can
 		// see that the connection was not gracefully closed.
-		eventCh <- readErrSynthEvent
+		rawEventCh <- string(readErrSynthEvent)
 	}
 
-	close(eventCh)
-	close(replyCh)
+	close(rawEventCh)
+	close(rawReplyCh)
 }

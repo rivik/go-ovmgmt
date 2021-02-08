@@ -1,4 +1,4 @@
-package openvpn
+package ovmgmt
 
 import (
 	"net"
@@ -110,7 +110,7 @@ func (l *MgmtListener) Serve(handler IncomingConnHandler) error {
 		// always reset our retry delay once we successfully read
 		tempDelay = 0
 
-		go handler.ServeOpenVPNMgmt(*incoming)
+		go handler.ServeOVpnMgmt(*incoming)
 	}
 }
 
@@ -121,10 +121,10 @@ type IncomingConn struct {
 // Open initiates communication with the connected OpenVPN process,
 // and establishes the channel on which events will be delivered.
 //
-// See the documentation for NewClient for discussion about the requirements
+// See the documentation for NewMgmtClient for discussion about the requirements
 // for eventCh.
 func (ic IncomingConn) Open(eventCh chan<- Event) *MgmtClient {
-	return NewClient(ic.conn, eventCh)
+	return NewMgmtClient(ic.conn, eventCh)
 }
 
 // Close abruptly closes the socket connected to the OpenVPN process.
@@ -140,7 +140,7 @@ func (ic IncomingConn) Close() error {
 }
 
 type IncomingConnHandler interface {
-	ServeOpenVPNMgmt(IncomingConn)
+	ServeOVpnMgmt(IncomingConn)
 }
 
 // IncomingConnHandlerFunc is an adapter to allow the use of ordinary
@@ -150,7 +150,7 @@ type IncomingConnHandler interface {
 // is an IncomingConnHandler that calls f.
 type IncomingConnHandlerFunc func(IncomingConn)
 
-func (f IncomingConnHandlerFunc) ServeOpenVPNMgmt(i IncomingConn) {
+func (f IncomingConnHandlerFunc) ServeOVpnMgmt(i IncomingConn) {
 	f(i)
 }
 

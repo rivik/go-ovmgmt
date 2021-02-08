@@ -1,38 +1,31 @@
-package openvpn
+package ovmgmt
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/apparentlymart/go-openvpn-mgmt/demux"
 )
 
-var newline = []byte{'\n'}
-var successPrefix = []byte("SUCCESS: ")
-var errorPrefix = []byte("ERROR: ")
-var endMessage = []byte("END")
+const newlineSep = "\n"
+const successPrefix = "SUCCESS: "
+const errorPrefix = "ERROR: "
+const endMessage = "END"
 
-// StatusFormat enum type
-type StatusFormat string
+// preallocate buffer for big responses
+const bigMessageLines = 100
 
-// StatusFormatDefault openvpn default status format
-// StatusFormatV3 openvpn version 3 status format
-const (
-	StatusFormatDefault StatusFormat = ""
-	StatusFormatV3      StatusFormat = "3"
-)
-
-// MgmtClient .
 type MgmtClient struct {
-	wr      io.Writer
-	replies <-chan []byte
+	wr             io.Writer
+	rawReplyCh     chan string
+	rawEventCh     chan string
+	doneStatus3Gen chan bool
+	eventSink      chan<- Event
 }
 
-// NewClient creates a new MgmtClient that communicates via the given
+// NewMgmtClient creates a new MgmtClient that communicates via the given
 // io.ReadWriter and emits events on the given channel.
 //
 // eventCh should be a buffered channel with a sufficient buffer depth
@@ -56,34 +49,75 @@ type MgmtClient struct {
 // is closed. Connection errors may also concurrently surface as error
 // responses from the client's various command methods, should an error
 // occur while we await a reply.
-func NewClient(conn io.ReadWriter, eventCh chan<- Event) *MgmtClient {
-	replyCh := make(chan []byte)
-	rawEventCh := make(chan []byte) // not buffered because eventCh should be
+func NewMgmtClient(conn io.ReadWriter, eventCh chan<- Event) *MgmtClient {
+	c := &MgmtClient{
+		wr:         conn,
+		rawReplyCh: make(chan string),
+		rawEventCh: make(chan string), // not buffered because eventCh should be
+		eventSink:  eventCh,
+	}
+	// initial status for 'done' channel (so we can safely close it and make new)
+	c.doneStatus3Gen = make(chan bool, 1)
 
-	go demux.Demultiplex(conn, replyCh, rawEventCh)
+	go Demultiplex(conn, c.rawReplyCh, c.rawEventCh)
+	go c.eventScanner()
+
+	return c
+}
+
+func (c *MgmtClient) eventScanner() {
+	buf := make([]string, 0, bigMessageLines)
+	bufKW := ""
+
+	flushMultilineBuf := func() {
+		defer func() {
+			bufKW = ""
+			buf = buf[:0]
+		}()
+		c.eventSink <- upgradeMultilineEvent(bufKW, buf)
+	}
 
 	// Get raw events and upgrade them into proper event types before
 	// passing them on to the caller's event channel.
-	go func() {
-		for raw := range rawEventCh {
-			eventCh <- upgradeEvent(raw)
-		}
-		close(eventCh)
-	}()
 
-	return &MgmtClient{
-		// replyCh acts as the reader for our ReadWriter, so we only
-		// need to retain the io.Writer for it, so we can send commands.
-		wr:      conn,
-		replies: replyCh,
+	for raw := range c.rawEventCh {
+		endMarker, keyword, body := splitEvent(raw)
+		//logDebugf("raw: %s; endMarker: %s, kw: %s, body: %s; bufKW: %s; buf: %#v\n", raw, endMarker, keyword, body, bufKW, buf)
+
+		if endMarker == emSingleLine {
+			// fetched single-line event
+			c.eventSink <- upgradeEvent(keyword, body)
+			if len(buf) > 0 || bufKW != "" {
+				// should never-ever happen
+				logErrorf("It is a single-line message, but buffer or bufKeyword not empty!")
+				flushMultilineBuf()
+			}
+		} else if raw == string(endMarker) {
+			// fetched multi-line event
+			flushMultilineBuf()
+		} else {
+			// multi-line event, save lines to buf until endMarker
+			if bufKW == "" {
+				bufKW = keyword
+			} else if bufKW != keyword {
+				// all multi-line event lines must start with first fetched bufKW
+				// this should never happen
+				logErrorf("Current keyword != first keyword for a multi-line message!")
+				flushMultilineBuf()
+				c.eventSink <- upgradeEvent(keyword, body)
+				continue
+			}
+			buf = append(buf, body)
+		}
 	}
+	close(c.eventSink)
 }
 
-// Dial is a convenience wrapper around NewClient that handles the common
+// Dial is a convenience wrapper around NewMgmtClient that handles the common
 // case of opening an TCP/IP socket to an OpenVPN management port and creating
 // a client for it.
 //
-// See the NewClient docs for discussion about the requirements for eventCh.
+// See the NewMgmtClient docs for discussion about the requirements for eventCh.
 //
 // OpenVPN will create a suitable management port if launched with the
 // following command line option:
@@ -101,7 +135,7 @@ func NewClient(conn io.ReadWriter, eventCh chan<- Event) *MgmtClient {
 //
 func Dial(addr string, eventCh chan<- Event) (*MgmtClient, error) {
 	proto := "tcp"
-	if len(addr) > 0 && addr[0] == '/' {
+	if len(addr) > 0 && strings.Contains(addr, "/") {
 		proto = "unix"
 	}
 	conn, err := net.Dial(proto, addr)
@@ -109,7 +143,7 @@ func Dial(addr string, eventCh chan<- Event) (*MgmtClient, error) {
 		return nil, err
 	}
 
-	return NewClient(conn, eventCh), nil
+	return NewMgmtClient(conn, eventCh), nil
 }
 
 // HoldRelease instructs OpenVPN to release any management hold preventing
@@ -131,6 +165,44 @@ func Dial(addr string, eventCh chan<- Event) (*MgmtClient, error) {
 func (c *MgmtClient) HoldRelease() error {
 	_, err := c.simpleCommand("hold release")
 	return err
+}
+
+// SetLogEvents either enables or disables asynchronous events for changes
+// in the OpenVPN connection state.
+//
+// When enabled, a LogEvent will be emitted from the event channel each
+// time the log message arrives. See LogEvent for more information
+// on the event structure.
+func (c *MgmtClient) SetLogEvents(on bool) error {
+	var err error
+	if on {
+		_, err = c.simpleCommand("log on")
+	} else {
+		_, err = c.simpleCommand("log off")
+	}
+	return err
+}
+
+// Change the OpenVPN --verb parameter.  The verb parameter
+// controls the output verbosity, and may range from 0 (no output)
+// to 15 (maximum output).  See the OpenVPN man page for additional
+// info on verbosity levels.
+func (c *MgmtClient) SetVerbosityLevel(level int) error {
+	var err error = fmt.Errorf("bad verbosity level '%d', should be from 0 to 15", level)
+	if level > 0 && level < 16 {
+		_, err = c.simpleCommand("verb " + strconv.Itoa(level))
+	}
+	return err
+}
+
+// Get the OpenVPN --verb parameter
+func (c *MgmtClient) VerbosityLevel() (int, error) {
+	result, err := c.simpleCommand("verb")
+	if !strings.HasPrefix(result, "verb=") {
+		return 0, err
+	}
+	level, err := strconv.Atoi(result[len("verb="):])
+	return level, err
 }
 
 // SetStateEvents either enables or disables asynchronous events for changes
@@ -200,7 +272,7 @@ func (c *MgmtClient) SendSignal(name string) error {
 // initial state after calling SetStateEvents(true) but before the first
 // state event is delivered.
 func (c *MgmtClient) LatestState() (*StateEvent, error) {
-	err := c.sendCommand([]byte("state"))
+	err := c.sendCommand("state")
 	if err != nil {
 		return nil, err
 	}
@@ -214,32 +286,8 @@ func (c *MgmtClient) LatestState() (*StateEvent, error) {
 		return nil, fmt.Errorf("Malformed OpenVPN 'state' response")
 	}
 
-	return &StateEvent{
-		body: payload[0],
-	}, nil
-}
-
-// LatestStatus retrieves the current daemon status information, in the same format as that produced by the OpenVPN --status directive.
-func (c *MgmtClient) LatestStatus(statusFormat StatusFormat) ([][]byte, error) {
-	var cmd []byte
-	if statusFormat == StatusFormatDefault {
-		cmd = []byte("status")
-	} else if statusFormat == StatusFormatV3 {
-		cmd = []byte("status 3")
-	} else {
-		return nil, fmt.Errorf("Incorrect 'status' format option")
-	}
-	err := c.sendCommand(cmd)
-	if err != nil {
-		return nil, err
-	}
-
-	payload, err := c.readCommandResponsePayload()
-	if err != nil {
-		return nil, err
-	}
-
-	return payload, nil
+	s, err := NewStateEvent(payload[0])
+	return &s, err
 }
 
 // Pid retrieves the process id of the connected OpenVPN process.
@@ -249,11 +297,11 @@ func (c *MgmtClient) Pid() (int, error) {
 		return 0, err
 	}
 
-	if !bytes.HasPrefix(raw, []byte("pid=")) {
+	if !strings.HasPrefix(raw, "pid=") {
 		return 0, fmt.Errorf("malformed response from OpenVPN")
 	}
 
-	pid, err := strconv.Atoi(string(raw[4:]))
+	pid, err := strconv.Atoi(raw[4:])
 	if err != nil {
 		return 0, fmt.Errorf("error parsing pid from OpenVPN: %s", err)
 	}
@@ -261,64 +309,55 @@ func (c *MgmtClient) Pid() (int, error) {
 	return pid, nil
 }
 
-func (c *MgmtClient) sendCommand(cmd []byte) error {
-	_, err := c.wr.Write(cmd)
-	if err != nil {
-		return err
-	}
-	_, err = c.wr.Write(newline)
+func (c *MgmtClient) sendCommand(cmd string) error {
+	_, err := c.wr.Write([]byte(cmd + newlineSep))
 	return err
 }
 
-// sendCommandPayload can be called after sendCommand for
-// commands that expect a multi-line input payload.
-//
-// The buffer given in 'payload' *must* end with a newline,
-// or else the protocol will be broken.
-func (c *MgmtClient) sendCommandPayload(payload []byte) error {
-	_, err := c.wr.Write(payload)
-	if err != nil {
-		return err
-	}
-	_, err = c.wr.Write(endMessage)
-	if err != nil {
-		return err
-	}
-	_, err = c.wr.Write(newline)
-	return err
-}
+// sendMultilineCommand can be called for commands that expect
+// a multi-line input payload.
+// func (c *MgmtClient) sendMultilineCommand(payload []string) error {
+// 	var err error
+// 	for _, cmd := range payload {
+// 		if err = c.sendCommand(cmd); err != nil {
+// 			return err
+// 		}
+// 	}
+// 	_, err = c.wr.Write([]byte(endMessage + newlineSep))
+// 	return err
+// }
 
-func (c *MgmtClient) readCommandResult() ([]byte, error) {
-	reply, ok := <-c.replies
+func (c *MgmtClient) readCommandResult() (string, error) {
+	reply, ok := <-c.rawReplyCh
 	if !ok {
-		return nil, fmt.Errorf("connection closed while awaiting result")
+		return "", fmt.Errorf("connection closed while awaiting result")
 	}
 
-	if bytes.HasPrefix(reply, successPrefix) {
+	if strings.HasPrefix(reply, successPrefix) {
 		result := reply[len(successPrefix):]
 		return result, nil
 	}
 
-	if bytes.HasPrefix(reply, errorPrefix) {
+	if strings.HasPrefix(reply, errorPrefix) {
 		message := reply[len(errorPrefix):]
-		return nil, ErrorFromServer(message)
+		return "", NewOVpnError(message)
 	}
 
-	return nil, fmt.Errorf("malformed result message")
+	return "", fmt.Errorf("malformed result message")
 }
 
-func (c *MgmtClient) readCommandResponsePayload() ([][]byte, error) {
-	lines := make([][]byte, 0, 10)
+func (c *MgmtClient) readCommandResponsePayload() ([]string, error) {
+	lines := make([]string, 0, bigMessageLines)
 
 	for {
-		line, ok := <-c.replies
+		line, ok := <-c.rawReplyCh
 		if !ok {
 			// We'll give the caller whatever we got before the connection
 			// closed, in case it's useful for debugging.
 			return lines, fmt.Errorf("connection closed before END recieved")
 		}
 
-		if bytes.Equal(line, endMessage) {
+		if line == endMessage {
 			break
 		}
 
@@ -328,10 +367,10 @@ func (c *MgmtClient) readCommandResponsePayload() ([][]byte, error) {
 	return lines, nil
 }
 
-func (c *MgmtClient) simpleCommand(cmd string) ([]byte, error) {
-	err := c.sendCommand([]byte(cmd))
+func (c *MgmtClient) simpleCommand(cmd string) (string, error) {
+	err := c.sendCommand(cmd)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	return c.readCommandResult()
 }
